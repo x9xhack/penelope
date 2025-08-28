@@ -16,7 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __program__= "penelope"
-__version__ = "0.14.2"
+__version__ = "0.14.3"
 
 import os
 import io
@@ -63,8 +63,8 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 ################################## PYTHON MISSING BATTERIES ####################################
-from random import choice
 from string import ascii_letters
+from random import choice, randint
 rand = lambda _len: ''.join(choice(ascii_letters) for i in range(_len))
 caller = lambda: inspect.stack()[2].function
 bdebug = lambda file, data: open("/tmp/" + file, "a").write(repr(data) + "\n")
@@ -1520,6 +1520,9 @@ class ControlQueue:
 				break
 		os.read(self._out, amount)
 
+	def close(self):
+		os.close(self._in)
+		os.close(self._out)
 
 class Core:
 
@@ -1535,6 +1538,7 @@ class Core:
 		self.session_wait = queue.LifoQueue()
 
 		self.lock = threading.Lock() # TO REMOVE
+		self.conn_semaphore = threading.Semaphore(5)
 
 		self.listenerID = 0
 		self.listener_lock = threading.Lock()
@@ -1604,8 +1608,7 @@ class Core:
 					_socket, endpoint = readable.socket.accept()
 					thread_name = f"NewCon{endpoint}"
 					logger.debug(f"New thread: {thread_name}")
-					threading.Thread(target=Session, args=(_socket, *endpoint, readable),
-						name=thread_name).start()
+					threading.Thread(target=Session, args=(_socket, *endpoint, readable), name=thread_name).start()
 
 				# STDIN
 				elif readable is sys.stdin:
@@ -1644,8 +1647,6 @@ class Core:
 
 					except OSError:
 						logger.debug("Died while reading")
-						if readable.OS:
-							threading.Thread(target=readable.maintain).start()
 						readable.kill()
 						break
 
@@ -1661,7 +1662,6 @@ class Core:
 							if _type == Messenger.SHELL:
 								if not _value: # TEMP
 									readable.kill()
-									threading.Thread(target=readable.maintain).start()
 									break
 								target.write(_value)
 
@@ -1699,8 +1699,6 @@ class Core:
 						sent = writable.socket.send(writable.outbuf.getvalue())
 					except OSError:
 						logger.debug("Died while writing")
-						if writable.OS:
-							threading.Thread(target=writable.maintain).start()
 						writable.kill()
 						break
 
@@ -1943,177 +1941,190 @@ class Channel:
 	def write(self, data):
 		os.write(self._write, data)
 
+	def close(self):
+		os.close(self._read)
+		os.close(self._write)
 
 class Session:
 
 	def __init__(self, _socket, target, port, listener=None):
-		print("\a", flush=True, end='')
+		with core.conn_semaphore:
+			#print(core.threads)
+			print("\a", flush=True, end='')
 
-		self.socket = _socket
-		self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-		self.socket.setblocking(False)
-		self.target, self.port = target, port
-		self.ip = _socket.getpeername()[0]
-		self._host, self._port = self.socket.getsockname()
-		self.listener = listener
-		self.source = 'reverse' if listener else 'bind'
+			self.socket = _socket
+			self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+			self.socket.setblocking(False)
+			self.target, self.port = target, port
+			try:
+				self.ip = _socket.getpeername()[0]
+			except:
+				logger.error(f"Invalid connection from {self.target} 🙄")
+				return
+			self._host, self._port = self.socket.getsockname()
+			self.listener = listener
+			self.source = 'reverse' if listener else 'bind'
 
-		self.id = None
-		self.OS = None
-		self.type = 'Basic'
-		self.subtype = None
-		self.interactive = None
-		self.echoing = None
-		self.pty_ready = None
-		self.readline = None
+			self.id = None
+			self.OS = None
+			self.type = 'Basic'
+			self.subtype = None
+			self.interactive = None
+			self.echoing = None
+			self.pty_ready = None
+			self.readline = None
 
-		self.win_version = None
+			self.win_version = None
 
-		self.prompt = None
-		self.new = True
+			self.prompt = None
+			self.new = True
 
-		self.last_lines = LineBuffer(options.attach_lines)
-		self.lock = threading.Lock()
-		self.wlock = threading.Lock()
+			self.last_lines = LineBuffer(options.attach_lines)
+			self.lock = threading.Lock()
+			self.wlock = threading.Lock()
 
-		self.outbuf = io.BytesIO()
-		self.shell_response_buf = io.BytesIO()
+			self.outbuf = io.BytesIO()
+			self.shell_response_buf = io.BytesIO()
 
-		self.tasks = {"portfwd":[], "scripts":[]}
-		self.subchannel = Channel()
-		self.latency = None
+			self.tasks = {"portfwd":[], "scripts":[]}
+			self.subchannel = Channel()
+			self.latency = None
 
-		self.alternate_buffer = False
-		self.agent = False
-		self.messenger = Messenger(io.BytesIO)
+			self.alternate_buffer = False
+			self.agent = False
+			self.messenger = Messenger(io.BytesIO)
 
-		self.streamID = 0
-		self.streams = dict()
-		self.stream_lock = threading.Lock()
-		self.stream_code = Messenger.STREAM_CODE
-		self.streams_max = 2 ** (8 * Messenger.STREAM_BYTES)
+			self.streamID = 0
+			self.streams = dict()
+			self.stream_lock = threading.Lock()
+			self.stream_code = Messenger.STREAM_CODE
+			self.streams_max = 2 ** (8 * Messenger.STREAM_BYTES)
 
-		self.shell_pid = None
-		self.user = None
-		self.tty = None
+			self.shell_pid = None
+			self.user = None
+			self.tty = None
 
-		self._bin = defaultdict(lambda: "")
-		self._tmp = None
-		self._cwd = None
-		self._can_deploy_agent = None
+			self._bin = defaultdict(lambda: "")
+			self._tmp = None
+			self._cwd = None
+			self._can_deploy_agent = None
 
-		self.bypass_control_session = False
-		self.upgrade_attempted = False
+			self.bypass_control_session = False
+			self.upgrade_attempted = False
 
-		core.rlist.append(self)
+			core.rlist.append(self)
 
-		if self.determine():
-			logger.debug(f"OS: {self.OS}")
-			logger.debug(f"Type: {self.type}")
-			logger.debug(f"Subtype: {self.subtype}")
-			logger.debug(f"Interactive: {self.interactive}")
-			logger.debug(f"Echoing: {self.echoing}")
+			if self.determine():
+				logger.debug(f"OS: {self.OS}")
+				logger.debug(f"Type: {self.type}")
+				logger.debug(f"Subtype: {self.subtype}")
+				logger.debug(f"Interactive: {self.interactive}")
+				logger.debug(f"Echoing: {self.echoing}")
 
-			self.get_system_info()
+				self.get_system_info()
 
-			if not self.hostname:
-				if target == self.ip:
-					try:
-						self.hostname = socket.gethostbyaddr(target)[0]
+				if not self.hostname:
+					if target == self.ip:
+						try:
+							self.hostname = socket.gethostbyaddr(target)[0]
 
-					except socket.herror:
-						self.hostname = ''
-						logger.debug("Cannot resolve hostname")
-				else:
-					self.hostname = target
+						except socket.herror:
+							self.hostname = ''
+							logger.debug("Cannot resolve hostname")
+					else:
+						self.hostname = target
 
-			hostname = self.hostname
-			c1 = '~' if hostname else ''
-			ip = self.ip
-			c2 = '-'
-			system = self.system
-			if not system:
-				system = self.OS.upper()
-			if self.arch:
-				system += '-' + self.arch
+				hostname = self.hostname
+				c1 = '~' if hostname else ''
+				ip = self.ip
+				c2 = '-'
+				system = self.system
+				if not system:
+					system = self.OS.upper()
+				if self.arch:
+					system += '-' + self.arch
 
-			self.name = f"{hostname}{c1}{ip}{c2}{system}"
-			self.name_colored = (
-				f"{paint(hostname).white_BLUE}{paint(c1).white_DIM}"
-				f"{paint(ip).white_RED}{paint(c2).white_DIM}"
-				f"{paint(system).cyan}"
-			)
+				self.name = f"{hostname}{c1}{ip}{c2}{system}"
+				self.name_colored = (
+					f"{paint(hostname).white_BLUE}{paint(c1).white_DIM}"
+					f"{paint(ip).white_RED}{paint(c2).white_DIM}"
+					f"{paint(system).cyan}"
+				)
 
-			self.id = core.new_sessionID
-			core.hosts[self.name].append(self)
-			core.sessions[self.id] = self
+				self.id = core.new_sessionID
+				core.hosts[self.name].append(self)
+				core.sessions[self.id] = self
 
-			if self.name == core.session_wait_host:
-				core.session_wait.put(self.id)
+				if self.name == core.session_wait_host:
+					core.session_wait.put(self.id)
 
-			logger.info(
-				f"Got {self.source} shell from "
-				f"{self.name_colored}{paint().green} 😍️ "
-				f"Assigned SessionID {paint('<' + str(self.id) + '>').yellow}"
-			)
+				logger.info(
+					f"Got {self.source} shell from "
+					f"{self.name_colored}{paint().green} 😍️ "
+					f"Assigned SessionID {paint('<' + str(self.id) + '>').yellow}"
+				)
 
-			self.directory = options.basedir / self.name
-			if not options.no_log:
-				self.directory.mkdir(parents=True, exist_ok=True)
-				self.logpath = self.directory / f'{datetime.now().strftime("%Y_%m_%d-%H_%M_%S-%f")[:-3]}.log'
-				self.histfile = self.directory / "readline_history"
-				self.logfile = open(self.logpath, 'ab', buffering=0)
-				if not options.no_timestamps:
-					self.logfile.write(str(paint(datetime.now().strftime("%Y-%m-%d %H:%M:%S: ")).magenta).encode())
+				self.directory = options.basedir / self.name
+				if not options.no_log:
+					self.directory.mkdir(parents=True, exist_ok=True)
+					self.logpath = self.directory / f'{datetime.now().strftime("%Y_%m_%d-%H_%M_%S-%f")[:-3]}.log'
+					self.histfile = self.directory / "readline_history"
+					self.logfile = open(self.logpath, 'ab', buffering=0)
+					if not options.no_timestamps:
+						self.logfile.write(str(paint(datetime.now().strftime("%Y-%m-%d %H:%M:%S: ")).magenta).encode())
 
-			for module in modules().values():
-				if module.enabled and module.on_session_start:
-					module.run(self)
+				for module in modules().values():
+					if module.enabled and module.on_session_start:
+						module.run(self)
 
-			self.maintain()
+				self.maintain()
 
-			if options.single_session and self.listener:
-				self.listener.stop()
+				if options.single_session and self.listener:
+					self.listener.stop()
 
-			if hasattr(listener_menu, 'active') and listener_menu.active:
-				os.close(listener_menu.control_w)
-				listener_menu.finishing.wait()
+				if hasattr(listener_menu, 'active') and listener_menu.active:
+					os.close(listener_menu.control_w)
+					listener_menu.finishing.wait()
 
-			attach_conditions = [
-				# Is a reverse shell and the Menu is not active and reached the maintain value
-				self.listener and not menu.active.is_set() and len(core.hosts[self.name]) == options.maintain,
+				attach_conditions = [
+					# Is a reverse shell and the Menu is not active and reached the maintain value
+					self.listener and not menu.active.is_set() and len(core.hosts[self.name]) == options.maintain,
 
-				# Is a bind shell and is not spawned from the Menu
-				not self.listener and not menu.active.is_set(),
+					# Is a bind shell and is not spawned from the Menu
+					not self.listener and not menu.active.is_set(),
 
-				# Is a bind shell and is spawned from the connect Menu command
-				not self.listener and menu.active.is_set() and menu.lastcmd.startswith('connect')
-			]
+					# Is a bind shell and is spawned from the connect Menu command
+					not self.listener and menu.active.is_set() and menu.lastcmd.startswith('connect')
+				]
 
-			# If no other session is attached
-			if core.attached_session is None:
-				# If auto-attach is enabled
-				if not options.no_attach:
-					if any(attach_conditions):
-						# Attach the newly created session
-						self.attach()
-				else:
-					if self.id == 1:
-						menu.set_id(self.id)
-					if not menu.active.is_set():
-						menu.show()
-		else:
-			self.kill()
-		return
+				# If no other session is attached
+				if core.attached_session is None:
+					# If auto-attach is enabled
+					if not options.no_attach:
+						if any(attach_conditions):
+							# Attach the newly created session
+							self.attach()
+					else:
+						if self.id == 1:
+							menu.set_id(self.id)
+						if not menu.active.is_set():
+							menu.show()
+			else:
+				self.kill()
+				time.sleep(1)
+			return
 
 	def __bool__(self):
 		return self.socket.fileno() != -1 # and self.OS)
 
 	def __repr__(self):
-		return (
-			f"ID: {self.id} -> {__class__.__name__}({self.name}, {self.OS}, {self.type}, "
-			f"interactive={self.interactive}, echoing={self.echoing})"
-		)
+		try:
+			return (
+				f"ID: {self.id} -> {__class__.__name__}({self.name}, {self.OS}, {self.type}, "
+				f"interactive={self.interactive}, echoing={self.echoing})"
+			)
+		except:
+			return f"ID: (for deletion: {self.id})"
 
 	def __getattr__(self, name):
 		if name == 'new_streamID':
@@ -2678,7 +2689,6 @@ class Session:
 			return None
 
 		with self.lock:
-			self.subchannel.control.clear()
 			if self.need_control_session and not self.bypass_control_session:
 				args = locals()
 				del args['self']
@@ -2693,6 +2703,7 @@ class Session:
 				logger.debug("Exec: The session is killed")
 				return False
 
+			self.subchannel.control.clear()
 			self.subchannel.active = True
 			self.subchannel.result = None
 			buffer = io.BytesIO()
@@ -2759,74 +2770,73 @@ class Session:
 
 			last_data = time.perf_counter()
 			need_check = False
-			while self.subchannel.result is None:
-				logger.debug(paint(f"Waiting for data (timeout={timeout})...").blue)
-				readables, _, _ = select([self.subchannel.control, self.subchannel], [], [], timeout)
+			try:
+				while self.subchannel.result is None:
+					logger.debug(paint(f"Waiting for data (timeout={timeout})...").blue)
+					readables, _, _ = select([self.subchannel.control, self.subchannel], [], [], timeout)
 
-				if self.subchannel.control in readables:
-					command = self.subchannel.control.get()
-					logger.debug(f"Subchannel Control Queue: {command}")
+					if self.subchannel.control in readables:
+						command = self.subchannel.control.get()
+						logger.debug(f"Subchannel Control Queue: {command}")
 
-					if command == 'stop':
-						self.subchannel.result = False
-						break
+						if command == 'stop':
+							self.subchannel.result = False
+							break
 
-					elif command == 'kill':
-						self.subchannel.can_use = False
-						self.subchannel.result = False
-						break
+					if self.subchannel in readables:
+						logger.debug(f"Latency: {time.perf_counter() - last_data}")
+						last_data = time.perf_counter()
 
-				if self.subchannel in readables:
-					logger.debug(f"Latency: {time.perf_counter() - last_data}")
-					last_data = time.perf_counter()
+						data = self.subchannel.read()
+						buffer.write(data)
+						logger.debug(f"{paint('Received').GREEN} -> {data}")
 
-					data = self.subchannel.read()
-					buffer.write(data)
-					logger.debug(f"{paint('Received').GREEN} -> {data}")
+						if timeout == data_timeout:
+							timeout = continuation_timeout
+							need_check = True
 
-					if timeout == data_timeout:
-						timeout = continuation_timeout
-						need_check = True
-
-				else:
-					if timeout == data_timeout:
-						logger.debug(paint("TIMEOUT").RED)
-						self.subchannel.result = False
-						break
 					else:
-						need_check = True
-						timeout = data_timeout
-
-				if need_check:
-					need_check = False
-
-					if raw and self.echoing and cmd:
-						result = buffer.getvalue()
-						if re.search(echoed_cmd_regex + (b'.' if self.interactive else b''), result, re.DOTALL):
-							self.subchannel.result = re.sub(echoed_cmd_regex, b'', result)
+						if timeout == data_timeout:
+							logger.debug(paint("TIMEOUT").RED)
+							self.subchannel.result = False
 							break
 						else:
-							logger.debug("The echoable is not exhausted")
-							continue
-					if not raw:
-						check = self.subchannel.pattern.search(buffer.getvalue())
-						if check:
-							logger.debug(paint('Got all data!').green)
-							self.subchannel.result = check[1]
-							break
-						logger.debug(paint('We didn\'t get all data; continue receiving').yellow)
+							need_check = True
+							timeout = data_timeout
 
-					elif expect_func:
-						if expect_func(buffer.getvalue()):
-							logger.debug(paint("The expected strings found in data").yellow)
+					if need_check:
+						need_check = False
+
+						if raw and self.echoing and cmd:
+							result = buffer.getvalue()
+							if re.search(echoed_cmd_regex + (b'.' if self.interactive else b''), result, re.DOTALL):
+								self.subchannel.result = re.sub(echoed_cmd_regex, b'', result)
+								break
+							else:
+								logger.debug("The echoable is not exhausted")
+								continue
+						if not raw:
+							check = self.subchannel.pattern.search(buffer.getvalue())
+							if check:
+								logger.debug(paint('Got all data!').green)
+								self.subchannel.result = check[1]
+								break
+							logger.debug(paint('We didn\'t get all data; continue receiving').yellow)
+
+						elif expect_func:
+							if expect_func(buffer.getvalue()):
+								logger.debug(paint("The expected strings found in data").yellow)
+								self.subchannel.result = buffer.getvalue()
+							else:
+								logger.debug(paint('No expected strings found in data. Receive again...').yellow)
+
+						else:
+							logger.debug(paint('Maybe got all data !?').yellow)
 							self.subchannel.result = buffer.getvalue()
-						else:
-							logger.debug(paint('No expected strings found in data. Receive again...').yellow)
-
-					else:
-						logger.debug(paint('Maybe got all data !?').yellow)
-						self.subchannel.result = buffer.getvalue()
-						break
+							break
+			except:
+				self.subchannel.can_use = False
+				self.subchannel.result = False
 
 			_stop = time.perf_counter()
 			logger.debug(f"{paint('FINAL TIME: ').white_BLUE}{_stop - _start}")
@@ -3893,8 +3903,7 @@ class Session:
 		return False
 
 	def kill(self):
-
-		if self not in core.rlist: # TODO check if it is needed
+		if self not in core.rlist:
 			return True
 
 		if menu.sid == self.id:
@@ -3903,33 +3912,34 @@ class Session:
 		thread_name = threading.current_thread().name
 		logger.debug(f"Thread <{thread_name}> wants to kill session {self.id}")
 
-		if self.OS and thread_name != 'Core':
-			if self.need_control_sessions and\
-				not self.spare_control_sessions and\
-				self.control_session is self:
-				sessions = ', '.join([str(session.id) for session in self.need_control_sessions])
-				if thread_name == 'Menu':
-					logger.warning(
-						f"Cannot kill Session {self.id} as the following sessions depend on it: {sessions}"
-					)
-					return False
-				else:
-					logger.error(f"Sessions {sessions} need a control session.")
+		if thread_name != 'Core':
+			if self.OS:
+				if self.need_control_sessions and\
+					not self.spare_control_sessions and\
+					self.control_session is self:
+					sessions = ', '.join([str(session.id) for session in self.need_control_sessions])
+					if thread_name == 'Menu':
+						logger.warning(
+							f"Cannot kill Session {self.id} as the following sessions depend on it: {sessions}"
+						)
+						return False
+					else:
+						logger.error(f"Sessions {sessions} need a control session.")
 
-			for module in modules().values():
-				if module.enabled and module.on_session_end:
-					module.run(self)
+				for module in modules().values():
+					if module.enabled and module.on_session_end:
+						module.run(self)
+			else:
+				self.id = randint(10**10, 10**11-1)
+				core.sessions[self.id] = self
 
 			core.control << f'self.sessions[{self.id}].kill()'
-
-			self.maintain()
 			return
 
-		if self.subchannel.active:
-			self.subchannel.control << 'kill'
+		self.subchannel.control.close()
+		self.subchannel.close()
 
 		core.rlist.remove(self)
-
 		if self in core.wlist:
 			core.wlist.remove(self)
 		try:
@@ -3937,20 +3947,19 @@ class Session:
 			#self.socket.shutdown(socket.SHUT_RDWR) # FIN
 		except OSError:
 			pass
-
 		self.socket.close()
 
 		if not self.OS:
 			message = f"Invalid shell from {self.ip} 🙄"
 		else:
-			del core.sessions[self.id]
-			core.hosts[self.name].remove(self)
 			message = f"Session [{self.id}] died..."
-
+			core.hosts[self.name].remove(self)
 			if not core.hosts[self.name]:
 				message += f" We lost {self.name_colored} 💔"
 				del core.hosts[self.name]
 
+		if self.id in core.sessions:
+			del core.sessions[self.id]
 		logger.error(message)
 
 		if hasattr(self, 'logfile'):
@@ -3968,6 +3977,8 @@ class Session:
 				control << "stop"
 			thread.join()
 
+		if self.OS:
+			threading.Thread(target=self.maintain).start()
 		return True
 
 
