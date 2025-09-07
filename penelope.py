@@ -16,7 +16,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __program__= "penelope"
-__version__ = "0.14.3"
+__version__ = "0.14.6"
 
 import os
 import io
@@ -474,11 +474,12 @@ def stdout(data, record=True):
 
 def ask(text):
 	try:
-		return input(f"{paint(f'[?] {text}').yellow}")
+		try:
+			return input(f"{paint(f'[?] {text}').yellow}")
 
-	except EOFError:
-		print()
-		return ask(text)
+		except EOFError:
+			print()
+			return ask(text)
 
 	except KeyboardInterrupt:
 		print("^C")
@@ -501,22 +502,24 @@ def my_input(text="", histfile=None, histlen=None, completer=lambda text, state:
 
 	core.output_line_buffer << b"\n" + text.encode()
 	core.wait_input = True
-	response = original_input(text)
-	core.wait_input = False
 
-	if readline:
-		#readline.set_completer(None)
-		#readline.set_completer_delims(default_readline_delims)
-		if histfile:
-			try:
-				readline.set_history_length(options.histlength)
-				#readline.add_history(response)
-				readline.write_history_file(histfile)
-			except Exception as e:
-				cmdlogger.debug(f"Error writing to history file: {e}")
-		#readline.set_auto_history(False)
+	try:
+		response = original_input(text)
 
-	return response
+		if readline:
+			#readline.set_completer(None)
+			#readline.set_completer_delims(default_readline_delims)
+			if histfile:
+				try:
+					readline.set_history_length(options.histlength)
+					#readline.add_history(response)
+					readline.write_history_file(histfile)
+				except Exception as e:
+					cmdlogger.debug(f"Error writing to history file: {e}")
+			#readline.set_auto_history(False)
+		return response
+	finally:
+		core.wait_input = False
 
 class BetterCMD:
 	def __init__(self, prompt=None, banner=None, histfile=None, histlen=None):
@@ -541,25 +544,26 @@ class BetterCMD:
 		stop = None
 		while not self.stop:
 			try:
-				self.active.wait()
-				if self.cmdqueue:
-					line = self.cmdqueue.pop(0)
-				else:
-					line = input(self.prompt, self.histfile, self.histlen, self.complete, " \t\n\"'><=;|&(:")
+				try:
+					self.active.wait()
+					if self.cmdqueue:
+						line = self.cmdqueue.pop(0)
+					else:
+						line = input(self.prompt, self.histfile, self.histlen, self.complete, " \t\n\"'><=;|&(:")
 
-				signal.signal(signal.SIGINT, lambda num, stack: self.interrupt())
-				line = self.precmd(line)
-				stop = self.onecmd(line)
-				stop = self.postcmd(stop, line)
-				if stop:
-					self.active.clear()
-			except EOFError:
-				stop = self.onecmd('EOF')
+					signal.signal(signal.SIGINT, lambda num, stack: self.interrupt())
+					line = self.precmd(line)
+					stop = self.onecmd(line)
+					stop = self.postcmd(stop, line)
+					if stop:
+						self.active.clear()
+				except EOFError:
+					stop = self.onecmd('EOF')
+				except Exception:
+					custom_excepthook(*sys.exc_info())
 			except KeyboardInterrupt:
 				print("^C")
 				self.interrupt()
-			except Exception:
-				custom_excepthook(*sys.exc_info())
 		self.postloop()
 
 	def onecmd(self, line):
@@ -875,7 +879,10 @@ class MainMenu(BetterCMD):
 						if self.sid == session.id:
 							ID = paint('[' + str(session.id) + ']').red
 						elif session.new:
-							ID = paint('<' + str(session.id) + '>').yellow_BLINK
+							if session.host_needs_control_session and session.control_session is session:
+								ID = paint(' ' + str(session.id)).cyan
+							else:
+								ID = paint('<' + str(session.id) + '>').yellow_BLINK
 						else:
 							ID = paint(' ' + str(session.id)).yellow
 						source = session.listener or f'Connect({session._host}:{session.port})'
@@ -923,6 +930,9 @@ class MainMenu(BetterCMD):
 				return False
 			else:
 				if ask(f"Kill all sessions{self.active_sessions} (y/N): ").lower() == 'y':
+					if options.maintain > 1:
+						options.maintain = 1
+						self.onecmd("maintain")
 					for session in reversed(list(core.sessions.copy().values())):
 						session.kill()
 		else:
@@ -1180,7 +1190,7 @@ class MainMenu(BetterCMD):
 				cmdlogger.error("Invalid number")
 		else:
 			status = paint('Enabled').white_GREEN if options.maintain >= 2 else paint('Disabled').white_RED
-			cmdlogger.info(f"Value set to {paint(options.maintain).yellow} {status}")
+			cmdlogger.info(f"Maintain value set to {paint(options.maintain).yellow} {status}")
 
 	@session_operation(current=True)
 	def do_upgrade(self, ID):
@@ -1518,7 +1528,7 @@ class ControlQueue:
 				amount += 1
 			except queue.Empty:
 				break
-		os.read(self._out, amount)
+		os.read(self._out, amount) # maybe needs 'try' because sometimes close() precedes
 
 	def close(self):
 		os.close(self._in)
@@ -2009,7 +2019,6 @@ class Session:
 			self._cwd = None
 			self._can_deploy_agent = None
 
-			self.bypass_control_session = False
 			self.upgrade_attempted = False
 
 			core.rlist.append(self)
@@ -2077,7 +2086,7 @@ class Session:
 					if module.enabled and module.on_session_start:
 						module.run(self)
 
-				self.maintain()
+				maintain_success = self.maintain()
 
 				if options.single_session and self.listener:
 					self.listener.stop()
@@ -2087,8 +2096,8 @@ class Session:
 					listener_menu.finishing.wait()
 
 				attach_conditions = [
-					# Is a reverse shell and the Menu is not active and reached the maintain value
-					self.listener and not menu.active.is_set() and len(core.hosts[self.name]) == options.maintain,
+					# Is a reverse shell and the Menu is not active and (reached the maintain value or maintain failed)
+					self.listener and not menu.active.is_set() and (len(core.hosts[self.name]) == options.maintain or not maintain_success),
 
 					# Is a bind shell and is not spawned from the Menu
 					not self.listener and not menu.active.is_set(),
@@ -2175,18 +2184,18 @@ class Session:
 
 	@property
 	def spare_control_sessions(self):
-		return [session for session in self.control_sessions if session is not self]
+		return [session for session in self.host_control_sessions if session is not self]
 
 	@property
-	def need_control_sessions(self):
+	def host_needs_control_session(self):
 		return [session for session in core.hosts[self.name] if session.need_control_session]
 
 	@property
 	def need_control_session(self):
-		return all([self.OS == 'Unix', self.type == 'PTY', not self.agent])
+		return all([self.OS == 'Unix', self.type == 'PTY', not self.agent, not self.new])
 
 	@property
-	def control_sessions(self):
+	def host_control_sessions(self):
 		return [session for session in core.hosts[self.name] if not session.need_control_session]
 
 	@property
@@ -2205,7 +2214,6 @@ class Session:
 			if not self.bin['uname']:
 				return False
 
-			self.bypass_control_session = True
 			response = self.exec(
 				r'printf "$({0} -n)\t'
 				r'$({0} -s)\t'
@@ -2213,7 +2221,6 @@ class Session:
 				agent_typing=True,
 				value=True
 			)
-			self.bypass_control_session = False
 
 			try:
 				self.hostname, self.system, self.arch = response.split("\t")
@@ -2240,12 +2247,10 @@ class Session:
 		return True
 
 	def get_shell_info(self, silent=False):
-		self.bypass_control_session = True
 		self.shell_pid = self.get_shell_pid()
 		self.user = self.get_user()
 		if self.OS == 'Unix':
 			self.tty = self.get_tty(silent=silent)
-		self.bypass_control_session = False
 
 	def get_shell_pid(self):
 		if self.OS == 'Unix':
@@ -2288,7 +2293,7 @@ class Session:
 				    f"procstat -f {self.shell_pid} 2>/dev/null | awk '$3==\"cwd\" {{print $NF;exit}}' | grep . || "
 				    f"pwdx {self.shell_pid} 2>/dev/null | awk '{{print $2;exit}}' | grep ."
 				)
-				self._cwd = self.control_session.exec(cmd, value=True)
+				self._cwd = self.exec(cmd, value=True)
 			elif self.OS == 'Windows':
 				self._cwd = self.exec("cd", force_cmd=True, value=True)
 		return self._cwd or ''
@@ -2689,7 +2694,7 @@ class Session:
 			return None
 
 		with self.lock:
-			if self.need_control_session and not self.bypass_control_session:
+			if self.need_control_session:
 				args = locals()
 				del args['self']
 				try:
@@ -2904,7 +2909,7 @@ class Session:
 				logger.warning("Python Agent is already deployed")
 				return False
 
-			if self.need_control_sessions and self.control_sessions == [self]:
+			if self.host_needs_control_session and self.host_control_sessions == [self]:
 				logger.warning("This is a control session and cannot be upgraded")
 				return False
 
@@ -3022,9 +3027,7 @@ class Session:
 			self.get_shell_info()
 
 			if _bin == self.bin['script']:
-				self.bypass_control_session = True
 				self.exec("stty sane")
-				self.bypass_control_session = False
 
 		elif self.OS == "Windows":
 			if self.type != 'PTY':
@@ -3066,19 +3069,16 @@ class Session:
 	def attach(self):
 		if threading.current_thread().name != 'Core':
 			if self.new:
-				self.new = False
-				self.bypass_control_session = True
 				upgrade_conditions = [
 					not options.no_upgrade,
-					not (self.need_control_session and self.control_sessions == [self]),
+					not (self.need_control_session and self.host_control_sessions == [self]),
 					not self.upgrade_attempted
 				]
 				if all(upgrade_conditions):
 					self.upgrade()
-				self.bypass_control_session = False
-
 				if self.prompt:
 					self.record(self.prompt)
+				self.new = False
 
 			core.control << f'self.sessions[{self.id}].attach()'
 			menu.active.clear() # Redundant but safeguard
@@ -3124,7 +3124,7 @@ class Session:
 		if self.agent:
 			self.exec(f"os.chdir('{self.cwd}')", python=True, value=True)
 		elif self.need_control_session:
-			self.control_session.exec(f"cd {self.cwd}")
+			self.exec(f"cd {self.cwd}")
 
 	def detach(self):
 		if self and self.OS == 'Unix' and (self.agent or self.need_control_session):
@@ -3434,6 +3434,8 @@ class Session:
 				pass # TODO
 		except Exception as e:
 			logger.error(e)
+			logger.warning("Cannot check remote permissions. Aborting...")
+			return []
 
 		# Initialization
 		try:
@@ -3792,6 +3794,7 @@ class Session:
 
 		elif self.OS == 'Windows':
 			logger.warning("Spawn Windows shells is not implemented yet")
+			return False
 
 		return True
 
@@ -3891,15 +3894,14 @@ class Session:
 
 	def maintain(self):
 		with core.lock:
-			current_num = len(core.hosts[self.name])
+			current_num = len(core.hosts[self.name]) if core.hosts else 0
 			if 0 < current_num < options.maintain:
 				session = core.hosts[self.name][-1]
 				logger.warning(paint(
 						f" --- Session {session.id} is trying to maintain {options.maintain} "
 						f"active shells on {self.name} ---"
 					).blue)
-				session.spawn()
-				return True
+				return session.spawn()
 		return False
 
 	def kill(self):
@@ -3914,17 +3916,13 @@ class Session:
 
 		if thread_name != 'Core':
 			if self.OS:
-				if self.need_control_sessions and\
+				if self.host_needs_control_session and\
 					not self.spare_control_sessions and\
 					self.control_session is self:
-					sessions = ', '.join([str(session.id) for session in self.need_control_sessions])
-					if thread_name == 'Menu':
-						logger.warning(
-							f"Cannot kill Session {self.id} as the following sessions depend on it: {sessions}"
-						)
-						return False
-					else:
-						logger.error(f"Sessions {sessions} need a control session.")
+
+					sessions = ', '.join([str(session.id) for session in self.host_needs_control_session])
+					logger.warning(f"Cannot kill Session {self.id} as the following sessions depend on it: [{sessions}]")
+					return False
 
 				for module in modules().values():
 					if module.enabled and module.on_session_end:
